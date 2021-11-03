@@ -24,6 +24,7 @@ CONF_PV_HYSTERESIS = 10.0
 
 
 class PVCharger:
+    # pylint: disable=no-member
     """Finite state machine to control the PV charging."""
 
     states = ["off", "idle", "pv", "boost", "calendar"]
