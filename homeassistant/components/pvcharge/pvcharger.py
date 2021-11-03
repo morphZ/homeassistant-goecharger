@@ -6,7 +6,6 @@ import logging
 from typing import Callable
 
 from simple_pid import PID
-from transitions.core import MachineError
 from transitions.extensions.asyncio import AsyncMachine
 
 from homeassistant.core import HomeAssistant, callback
@@ -54,14 +53,21 @@ class PVCharger:
         self.pid = PID(
             -1.0, -0.1, 0.0, setpoint=0.0, sample_time=1, output_limits=(2.0, 11.0)
         )
-        self.control: float | None = 0.0
-        self.current: float | None = None
+        self.control = 0.0
+        self.current = float(hass.states.get(CONF_GRID_BALANCE_ENTITY).state)  # type: ignore
+        self.pid_interval = REFRESH_INTERVAL
         self.pid_handle: Callable | None = None
-        self.pid_interval: timedelta = REFRESH_INTERVAL
 
         self.watch_handle = async_track_state_change(
             self.hass, CONF_GRID_BALANCE_ENTITY, self.async_watch_balance
         )
+
+    async def go(self) -> None:
+        """Start up the Charger depending on available power."""
+        if self.enough_power:
+            await self.to_pv()  # type: ignore
+        else:
+            await self.to_idle()  # type: ignore
 
     @callback
     async def async_update_pid(self, event_time) -> None:
@@ -72,6 +78,16 @@ class PVCharger:
             "Data is self.current=%s, self.control=%s", self.current, self.control
         )
 
+    @property
+    def enough_power(self) -> bool:
+        """Check if enough power is available."""
+        threshold = (
+            CONF_PV_THRESHOLD - CONF_PV_HYSTERESIS
+            if self.is_pv()  # type: ignore
+            else CONF_PV_THRESHOLD
+        )
+        return self.current > threshold
+
     @callback
     async def async_watch_balance(self, entity, old_state, new_state) -> None:
         """Watch for grid balance and act accordingly."""
@@ -79,25 +95,11 @@ class PVCharger:
 
         self.current = float(new_state.state)
 
-        if self.current > CONF_PV_THRESHOLD:
-            try:
-                await self.start()  # type: ignore
-            except MachineError as exc:
-                _LOGGER.debug(
-                    "Tried to switch to start, but MachineError occurred",
-                    exc_info=exc,
-                )
+        if self.is_pv() and not self.enough_power:  # type: ignore
+            await self.pause()  # type: ignore
 
-        if self.current < CONF_PV_THRESHOLD - (
-            CONF_PV_HYSTERESIS if self.is_pv() else 0  # type: ignore
-        ):
-            try:
-                await self.pause()  # type: ignore
-            except MachineError as exc:
-                _LOGGER.debug(
-                    "Tried to switch to pause, but MachineError occurred",
-                    exc_info=exc,
-                )
+        if self.is_idle() and self.enough_power:  # type: ignore
+            await self.start()  # type: ignore
 
     async def on_enter_pv(self) -> None:
         """Start control loop for pv controlled charging."""
