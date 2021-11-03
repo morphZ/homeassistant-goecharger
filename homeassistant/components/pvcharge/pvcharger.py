@@ -23,19 +23,22 @@ CONF_GRID_BALANCE_ENTITY = "input_number.grid_return"
 CONF_PV_THRESHOLD = 0.5
 CONF_PV_HYSTERESIS = 10.0
 CONF_DEFAULT_MAX_TIME = timedelta(minutes=30)
+CONF_SOC_ENTITY = "input_number.soc"
+CONF_MIN_SOC = 30
 
 
 class PVCharger:
     # pylint: disable=no-member
     """Finite state machine to control the PV charging."""
 
-    states = ["off", "idle", "pv", "max", "low", "calendar"]
+    states = ["off", "idle", "pv", "max", "low_batt", "calendar"]
     transitions = [
-        ["auto", ["off", "max", "low", "calendar"], "pv", "enough_power"],
-        ["auto", ["off", "max", "low", "calendar"], "idle"],
+        ["auto", ["off", "max", "low_batt", "calendar"], "pv", "enough_power"],
+        ["auto", ["off", "max", "low_batt", "calendar"], "idle"],
         ["start", "idle", "pv"],
         ["pause", "pv", "idle"],
         ["boost", "*", "max"],
+        ["soc_low", ["idle", "pv"], "low_batt"],
     ]
 
     def __init__(self, hass: HomeAssistant) -> None:
@@ -56,20 +59,16 @@ class PVCharger:
         )
         self.control = 0.0
         self.current = float(hass.states.get(CONF_GRID_BALANCE_ENTITY).state)  # type: ignore
+        self.soc = float(hass.states.get(CONF_SOC_ENTITY).state)  # type: ignore
         self.pid_interval = REFRESH_INTERVAL
         self.pid_handle: Callable | None = None
         self.timeisup_handle: Callable | None = None
 
         self.watch_handle = async_track_state_change(
-            self.hass, CONF_GRID_BALANCE_ENTITY, self._async_watch_balance
+            self.hass,
+            [CONF_GRID_BALANCE_ENTITY, CONF_SOC_ENTITY],
+            self._async_watch_balance,
         )
-
-    async def go(self) -> None:
-        """Start up the Charger depending on available power."""
-        if self.enough_power:
-            await self.to_pv()  # type: ignore
-        else:
-            await self.to_idle()  # type: ignore
 
     @callback
     async def _async_update_pid(self, event_time) -> None:
@@ -90,21 +89,41 @@ class PVCharger:
         )
         return self.current > threshold
 
+    @property
+    def min_soc(self) -> bool:
+        """Check if minimal SOC is reached."""
+        return self.soc >= CONF_MIN_SOC
+
     @callback
     async def _async_watch_balance(self, entity, old_state, new_state) -> None:
-        """Watch for grid balance and act accordingly."""
-        _LOGGER.debug("Enter async_watch_balance callback")
+        """Watch for changed inputs and act accordingly."""
+        _LOGGER.debug("Update changed inputs")
 
-        self.current = float(new_state.state)
+        if entity == CONF_GRID_BALANCE_ENTITY:
+            # Update new grid balance state in memory
+            self.current = float(new_state.state)
 
-        if self.is_pv() and not self.enough_power:  # type: ignore
-            await self.pause()  # type: ignore
+            # Check if mode change is necessary
+            if self.is_pv() and not self.enough_power:  # type: ignore
+                await self.pause()  # type: ignore
 
-        if self.is_idle() and self.enough_power:  # type: ignore
-            await self.start()  # type: ignore
+            if self.is_idle() and self.enough_power:  # type: ignore
+                await self.start()  # type: ignore
+
+        if entity == CONF_SOC_ENTITY:
+            # Update new SOC state in instance
+            self.soc = float(new_state.state)
+
+            # Check if mode change is necesasry
+            if self.is_low_batt() and self.min_soc:  # type: ignore
+                await self.auto()  # type: ignore
+
+            if (self.is_idle() or self.is_pv()) and not self.min_soc:  # type: ignore
+                await self.soc_low()  # type: ignore
 
     async def on_enter_pv(self, *args, **kwargs) -> None:
         """Start control loop for pv controlled charging."""
+        _LOGGER.info("Enter PID charging mode")
 
         self.pid_handle = async_track_time_interval(
             self.hass,
@@ -137,6 +156,10 @@ class PVCharger:
         if self.timeisup_handle is not None:
             self.timeisup_handle()
             self.timeisup_handle = None
+
+    async def on_enter_low_batt(self) -> None:
+        """Charge with max power until min soc is reached."""
+        _LOGGER.info("Enter battery low mode")
 
     def close(self):
         """Close open callback handles."""
