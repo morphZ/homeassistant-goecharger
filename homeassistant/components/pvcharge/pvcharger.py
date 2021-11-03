@@ -72,13 +72,6 @@ class PVCharger:
             "Data is self.current=%s, self.control=%s", self.current, self.control
         )
 
-    def close(self):
-        """Close open callback handles."""
-        _LOGGER.debug("Closing %s", self)
-        if self.watch_handle is not None:
-            self.watch_handle()
-            self.pid_handle = None
-
     @callback
     async def async_watch_balance(self, entity, old_state, new_state) -> None:
         """Watch for grid balance and act accordingly."""
@@ -120,4 +113,11 @@ class PVCharger:
 
         if self.pid_handle is not None:
             self.pid_handle()
+            self.pid_handle = None
+
+    def close(self):
+        """Close open callback handles."""
+        _LOGGER.debug("Closing %s", self)
+        if self.watch_handle is not None:
+            self.watch_handle()
             self.pid_handle = None
