@@ -20,6 +20,9 @@ _LOGGER = logging.getLogger(__name__)
 REFRESH_INTERVAL = timedelta(seconds=5)
 MOVING_AVERAGE_WINDOW = 10
 CONF_GRID_BALANCE_ENTITY = "input_number.grid_return"
+CONF_CHARGE_ENTITY = "input_number.charge_power"
+CONF_CHARGE_MIN = 2.0
+CONF_CHARGE_MAX = 11.0
 CONF_PV_THRESHOLD = 0.5
 CONF_PV_HYSTERESIS = 10.0
 CONF_DEFAULT_MAX_TIME = timedelta(minutes=30)
@@ -55,9 +58,14 @@ class PVCharger:
         )
 
         self.pid = PID(
-            -1.0, -0.1, 0.0, setpoint=0.0, sample_time=1, output_limits=(2.0, 11.0)
+            -1.0,
+            -0.1,
+            0.0,
+            setpoint=0.0,
+            sample_time=1,
+            output_limits=(CONF_CHARGE_MIN, CONF_CHARGE_MAX),
         )
-        self.control = 0.0
+        self.control = CONF_CHARGE_MIN
         self.current = float(hass.states.get(CONF_GRID_BALANCE_ENTITY).state)  # type: ignore
         self.soc = float(hass.states.get(CONF_SOC_ENTITY).state)  # type: ignore
         self.pid_interval = REFRESH_INTERVAL
@@ -71,6 +79,14 @@ class PVCharger:
         )
 
     @callback
+    async def _async_update_control(self) -> None:
+        await self.hass.services.async_call(
+            "input_number",
+            "set_value",
+            {"entity_id": CONF_CHARGE_ENTITY, "value": self.control},
+        )
+
+    @callback
     async def _async_update_pid(self, event_time) -> None:
         """Update pid controller values."""
         _LOGGER.debug("Call _async_update_pid() callback at %s", event_time)
@@ -78,6 +94,7 @@ class PVCharger:
         _LOGGER.debug(
             "Data is self.current=%s, self.control=%s", self.current, self.control
         )
+        await self._async_update_control()
 
     @property
     def enough_power(self) -> bool:
