@@ -15,19 +15,9 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
 )
 
-_LOGGER = logging.getLogger(__name__)
+from .const import DOMAIN
 
-REFRESH_INTERVAL = timedelta(seconds=5)
-MOVING_AVERAGE_WINDOW = 10
-CONF_GRID_BALANCE_ENTITY = "input_number.grid_return"
-CONF_CHARGE_ENTITY = "input_number.charge_power"
-CONF_CHARGE_MIN = 2.0
-CONF_CHARGE_MAX = 11.0
-CONF_PV_THRESHOLD = 0.5
-CONF_PV_HYSTERESIS = 10.0
-CONF_DEFAULT_MAX_TIME = timedelta(minutes=30)
-CONF_SOC_ENTITY = "input_number.soc"
-CONF_MIN_SOC = 30
+_LOGGER = logging.getLogger(__name__)
 
 
 class PVCharger:
@@ -46,10 +36,13 @@ class PVCharger:
         ["halt", "*", "off"],
     ]
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(self, hass: HomeAssistant, config) -> None:
         """Set up PVCharger instance."""
 
         self.hass: HomeAssistant = hass
+
+        for k in config[DOMAIN]:
+            setattr(self, k, config[DOMAIN][k])
 
         self.machine = AsyncMachine(
             model=self,
@@ -65,12 +58,12 @@ class PVCharger:
             0.0,
             setpoint=0.0,
             sample_time=1,
-            output_limits=(CONF_CHARGE_MIN, CONF_CHARGE_MAX),
+            output_limits=(self.charge_min, self.charge_max),  # type: ignore
         )
-        self.control = CONF_CHARGE_MIN
-        self.current = float(hass.states.get(CONF_GRID_BALANCE_ENTITY).state)  # type: ignore
-        self.soc = float(hass.states.get(CONF_SOC_ENTITY).state)  # type: ignore
-        self.pid_interval = REFRESH_INTERVAL
+        self.control = self.charge_min  # type: ignore
+        self.current = float(hass.states.get(self.balance_entity).state)  # type: ignore
+        self.soc = float(hass.states.get(self.soc_entity).state)  # type: ignore
+        self.pid_interval = self.refresh_interval  # type: ignore
         self.pid_handle: Callable | None = None
         self.timeisup_handle: Callable | None = None
 
@@ -81,14 +74,14 @@ class PVCharger:
         await self.hass.services.async_call(
             "input_number",
             "set_value",
-            {"entity_id": CONF_CHARGE_ENTITY, "value": self.control},
+            {"entity_id": self.charge_entity, "value": self.control},  # type: ignore
         )
 
     @callback
     async def _async_update_pid(self, event_time) -> None:
         """Update pid controller values."""
         _LOGGER.debug("Call _async_update_pid() callback at %s", event_time)
-        self.control = self.pid(self.current)  # type: ignore
+        self.control = self.pid(self.current)
         _LOGGER.debug(
             "Data is self.current=%s, self.control=%s", self.current, self.control
         )
@@ -99,7 +92,7 @@ class PVCharger:
         """Watch for changed inputs and act accordingly."""
         _LOGGER.debug("Update changed inputs")
 
-        if entity == CONF_GRID_BALANCE_ENTITY:
+        if entity == self.balance_entity:  # type: ignore
             # Update new grid balance state in memory
             self.current = float(new_state.state)
 
@@ -110,7 +103,7 @@ class PVCharger:
             if self.is_idle() and self.enough_power:  # type: ignore
                 await self.start()  # type: ignore
 
-        if entity == CONF_SOC_ENTITY:
+        if entity == self.soc_entity:  # type: ignore
             # Update new SOC state in instance
             self.soc = float(new_state.state)
 
@@ -130,22 +123,22 @@ class PVCharger:
     def enough_power(self) -> bool:
         """Check if enough power is available."""
         threshold = (
-            CONF_PV_THRESHOLD - CONF_PV_HYSTERESIS
+            self.pv_threshold - self.pv_hysteresis  # type: ignore
             if self.is_pv()  # type: ignore
-            else CONF_PV_THRESHOLD
+            else self.pv_threshold  # type: ignore
         )
         return self.current > threshold
 
     @property
     def min_soc(self) -> bool:
         """Check if minimal SOC is reached."""
-        return self.soc >= CONF_MIN_SOC
+        return self.soc >= self.soc_low_value  # type: ignore
 
     async def on_exit_off(self) -> None:
         """Register state watcher callback when leaving off mode."""
         self._watch_handle = async_track_state_change(
             self.hass,
-            [CONF_GRID_BALANCE_ENTITY, CONF_SOC_ENTITY],
+            [self.balance_entity, self.soc_entity],  # type: ignore
             self._async_watch_balance,
         )
 
@@ -160,30 +153,32 @@ class PVCharger:
         _LOGGER.info("Enter PID charging mode")
 
         # Start PID mode with minimal charge power
-        self.control = CONF_CHARGE_MIN
+        self.control = self.charge_min  # type: ignore
         await self._async_update_control()
         self.pid.set_auto_mode(True, self.control)
 
         self.pid_handle = async_track_time_interval(
             self.hass,
             self._async_update_pid,
-            self.pid_interval,
+            timedelta(seconds=self.pid_interval),
         )
 
     async def on_exit_pv(self) -> None:
         """Stop pid loop."""
 
+        self.pid.set_auto_mode(False)
+
         if self.pid_handle is not None:
             self.pid_handle()
             self.pid_handle = None
 
-    async def on_enter_max(self, duration: timedelta = CONF_DEFAULT_MAX_TIME) -> None:
+    async def on_enter_max(self, duration: timedelta = timedelta(minutes=30)) -> None:
         """Load EV battery with maximal power."""
 
         self.timeisup_handle = async_call_later(
             self.hass, duration, self._async_time_is_up
         )
-        self.control = CONF_CHARGE_MAX
+        self.control = self.charge_max  # type: ignore
         await self._async_update_control()
 
     async def on_exit_max(self) -> None:
@@ -197,5 +192,5 @@ class PVCharger:
         """Charge with max power until min soc is reached."""
         _LOGGER.info("Enter battery low mode")
 
-        self.control = CONF_CHARGE_MAX
+        self.control = self.charge_max  # type: ignore
         await self._async_update_control()
