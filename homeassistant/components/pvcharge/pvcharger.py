@@ -69,12 +69,20 @@ class PVCharger:
 
         self._watch_handle: Callable | None = None
 
-    @callback
     async def _async_update_control(self) -> None:
         await self.hass.services.async_call(
             "input_number",
             "set_value",
             {"entity_id": self.charge_entity, "value": self.control},  # type: ignore
+        )
+
+    async def _async_turn_charge_switch(self, value: bool) -> None:
+        service = "turn_on" if value else "turn_off"
+
+        await self.hass.services.async_call(
+            "input_boolean",
+            service,
+            target={"entity_id": self.charge_switch},  # type: ignore
         )
 
     @callback
@@ -157,6 +165,9 @@ class PVCharger:
         await self._async_update_control()
         self.pid.set_auto_mode(True, self.control)
 
+        if self.charge_switch:  # type: ignore
+            await self._async_turn_charge_switch(True)
+
         self.pid_handle = async_track_time_interval(
             self.hass,
             self._async_update_pid,
@@ -167,6 +178,9 @@ class PVCharger:
         """Stop pid loop."""
 
         self.pid.set_auto_mode(False)
+
+        if self.charge_switch:  # type: ignore
+            await self._async_turn_charge_switch(False)
 
         if self.pid_handle is not None:
             self.pid_handle()
@@ -181,6 +195,9 @@ class PVCharger:
         self.control = self.charge_max  # type: ignore
         await self._async_update_control()
 
+        if self.charge_switch:  # type: ignore
+            await self._async_turn_charge_switch(True)
+
     async def on_exit_max(self) -> None:
         """Cancel pending timeouts."""
 
@@ -188,9 +205,21 @@ class PVCharger:
             self.timeisup_handle()
             self.timeisup_handle = None
 
+        if self.charge_switch:  # type: ignore
+            await self._async_turn_charge_switch(False)
+
     async def on_enter_low_batt(self) -> None:
         """Charge with max power until min soc is reached."""
         _LOGGER.info("Enter battery low mode")
 
         self.control = self.charge_max  # type: ignore
         await self._async_update_control()
+
+        if self.charge_switch:  # type: ignore
+            await self._async_turn_charge_switch(True)
+
+    async def on_exit_low_batt(self) -> None:
+        """Turn charge switch off."""
+
+        if self.charge_switch:  # type: ignore
+            await self._async_turn_charge_switch(False)
