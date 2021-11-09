@@ -8,9 +8,11 @@ from typing import Any, Callable
 from simple_pid import PID
 from transitions.extensions.asyncio import AsyncMachine
 
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.event import (  # async_track_state_change,
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import (
+    Event,
     TrackTemplate,
+    TrackTemplateResult,
     async_call_later,
     async_track_template_result,
     async_track_time_interval,
@@ -93,12 +95,11 @@ class PVCharger:
             output_limits=(self.charge_min, self.charge_max),
         )
 
-    @callable
-    async def _async_watch_balance(self, event, updates) -> None:
+    async def _async_watch_balance(
+        self, event: Event, updates: list[TrackTemplateResult]
+    ) -> None:
         track_template_result = updates.pop()
-        # template = track_template_result.template
         result = track_template_result.result
-        # entity = event and event.data.get("entity_id")
 
         self.current = float(result)
 
@@ -109,12 +110,11 @@ class PVCharger:
         if self.is_idle() and self.enough_power:  # type: ignore
             await self.start()  # type: ignore
 
-    @callable
-    async def _async_watch_soc(self, event, updates) -> None:
+    async def _async_watch_soc(
+        self, event: Event, updates: list[TrackTemplateResult]
+    ) -> None:
         track_template_result = updates.pop()
-        # template = track_template_result.template
         result = track_template_result.result
-        # entity = event and event.data.get("entity_id")
 
         self.soc = float(result)
 
@@ -141,7 +141,6 @@ class PVCharger:
             target={"entity_id": self.charge_switch},
         )
 
-    @callback
     async def _async_update_pid(self, event_time) -> None:
         """Update pid controller values."""
         _LOGGER.debug("Call _async_update_pid() callback at %s", event_time)
@@ -151,34 +150,6 @@ class PVCharger:
         )
         await self._async_update_control()
 
-    # @callback
-    # async def _async_watch_balance(self, entity, old_state, new_state) -> None:
-    #     """Watch for changed inputs and act accordingly."""
-    #     _LOGGER.debug("Update changed inputs")
-
-    #     if entity == self.balance_entity:  # type: ignore
-    #         # Update new grid balance state in memory
-    #         self.current = float(new_state.state)
-
-    #         # Check if mode change is necessary
-    #         if self.is_pv() and not self.enough_power:  # type: ignore
-    #             await self.pause()  # type: ignore
-
-    #         if self.is_idle() and self.enough_power:  # type: ignore
-    #             await self.start()  # type: ignore
-
-    #     if entity == self.soc_entity:  # type: ignore
-    #         # Update new SOC state in instance
-    #         self.soc = float(new_state.state)
-
-    #         # Check if mode change is necesasry
-    #         if self.is_low_batt() and self.min_soc:  # type: ignore
-    #             await self.auto()  # type: ignore
-
-    #         if (self.is_idle() or self.is_pv()) and not self.min_soc:  # type: ignore
-    #             await self.soc_low()  # type: ignore
-
-    @callback
     async def _async_time_is_up(self, *args, **kwargs) -> None:
         self.timeisup_handle = None
         await self.auto()  # type: ignore
@@ -200,11 +171,6 @@ class PVCharger:
 
     async def on_exit_off(self) -> None:
         """Register state watcher callback when leaving off mode."""
-        # self._watch_handle = async_track_state_change(
-        #     self.hass,
-        #     [self.balance_entity, self.soc_entity],  # type: ignore
-        #     self._async_watch_balance,
-        # )
 
         self._handles["balance"] = async_track_template_result(
             self.hass,
@@ -222,10 +188,6 @@ class PVCharger:
         """Cancel state watcher callback when entering off mode."""
         for t in ["balance", "soc"]:
             self._handles.pop(t).async_remove()
-
-        # if self._watch_handle is not None:
-        #     self._watch_handle()
-        #     self._watch_handle = None
 
     async def on_enter_pv(self, *args, **kwargs) -> None:
         """Start control loop for pv controlled charging."""
