@@ -3,18 +3,15 @@ from __future__ import annotations
 
 from datetime import timedelta
 import logging
-from typing import Any, Callable
+from typing import Any
 
 from simple_pid import PID
 from transitions.extensions.asyncio import AsyncMachine
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import (
-    Event,
-    TrackTemplate,
-    TrackTemplateResult,
     async_call_later,
-    async_track_template_result,
+    async_track_state_change,
     async_track_time_interval,
 )
 
@@ -40,43 +37,39 @@ class PVCharger:
     def __init__(
         self,
         hass: HomeAssistant,
-        balance_template,
+        balance_entity,
+        balance_setpoint,
         charge_switch,
         charge_min,
         charge_max,
         pv_threshold,
         pv_hysteresis,
         duration,
-        soc_template,
+        soc_entity,
         low_value,
         pid_interval,
     ) -> None:
         """Set up PVCharger instance."""
 
         self.hass = hass
-        self.balance_template = balance_template
-        self.balance_template.hass = hass
+        self.balance_entity = balance_entity
+        self.balance_setpoint = balance_setpoint
         self.charge_switch = charge_switch
         self.charge_min = charge_min
         self.charge_max = charge_max
         self.pv_threshold = pv_threshold
         self.pv_hysteresis = pv_hysteresis
         self.duration = duration
-        self.soc_template = soc_template
-        self.soc_template.hass = hass
+        self.soc_entity = soc_entity
         self.low_value = low_value
         self.pid_interval = pid_interval
 
         # Initialize basic controller variables
         self.control = charge_min
-        self.current = float(self.balance_template.async_render())
-        self.soc = float(self.soc_template.async_render())
+        self.current = float(self.hass.states.get(self.balance_entity).state)  # type: ignore
+        self.soc = float(self.hass.states.get(self.soc_entity).state)  # type: ignore
 
         self._handles: dict[str, Any] = {}
-
-        self.pid_handle: Callable | None = None
-        self.timeisup_handle: Callable | None = None
-        self._watch_handle: Callable | None = None
 
         self.machine = AsyncMachine(
             model=self,
@@ -90,18 +83,19 @@ class PVCharger:
             -1.0,
             -0.1,
             0.0,
-            setpoint=0.0,
+            setpoint=self.balance_setpoint,
             sample_time=1,
             output_limits=(self.charge_min, self.charge_max),
         )
 
     async def _async_watch_balance(
-        self, event: Event, updates: list[TrackTemplateResult]
+        self,
+        entity,
+        old_state,
+        new_state,
     ) -> None:
-        track_template_result = updates.pop()
-        result = track_template_result.result
-
-        self.current = float(result)
+        """Update internal balance variable and change state if necessary."""
+        self.current = float(new_state.state)
 
         # Check if mode change is necessary
         if self.is_pv() and not self.enough_power:  # type: ignore
@@ -111,12 +105,13 @@ class PVCharger:
             await self.start()  # type: ignore
 
     async def _async_watch_soc(
-        self, event: Event, updates: list[TrackTemplateResult]
+        self,
+        entity,
+        old_state,
+        new_state,
     ) -> None:
-        track_template_result = updates.pop()
-        result = track_template_result.result
-
-        self.soc = float(result)
+        """Update internal soc variable and change state if necessary."""
+        self.soc = float(new_state.state)
 
         # Check if mode change is necesasry
         if self.is_low_batt() and self.min_soc:  # type: ignore
@@ -151,7 +146,7 @@ class PVCharger:
         await self._async_update_control()
 
     async def _async_time_is_up(self, *args, **kwargs) -> None:
-        self.timeisup_handle = None
+        self._handles.pop("timer", None)
         await self.auto()  # type: ignore
 
     @property
@@ -172,22 +167,22 @@ class PVCharger:
     async def on_exit_off(self) -> None:
         """Register state watcher callback when leaving off mode."""
 
-        self._handles["balance"] = async_track_template_result(
+        self._handles["balance"] = async_track_state_change(
             self.hass,
-            [TrackTemplate(self.balance_template, None)],
-            self._async_watch_balance,  # type: ignore
+            [self.balance_entity],
+            self._async_watch_balance,
         )
 
-        self._handles["soc"] = async_track_template_result(
+        self._handles["soc"] = async_track_state_change(
             self.hass,
-            [TrackTemplate(self.soc_template, None)],
-            self._async_watch_soc,  # type: ignore
+            [self.soc_entity],
+            self._async_watch_soc,
         )
 
     async def on_enter_off(self) -> None:
         """Cancel state watcher callback when entering off mode."""
-        for t in ["balance", "soc"]:
-            self._handles.pop(t).async_remove()
+        for handle in ("balance", "soc"):
+            self._handles.pop(handle).async_remove()
 
     async def on_enter_pv(self, *args, **kwargs) -> None:
         """Start control loop for pv controlled charging."""
@@ -201,7 +196,7 @@ class PVCharger:
         if self.charge_switch:
             await self._async_turn_charge_switch(True)
 
-        self.pid_handle = async_track_time_interval(
+        self._handles["pid"] = async_track_time_interval(
             self.hass,
             self._async_update_pid,
             timedelta(seconds=self.pid_interval),
@@ -215,14 +210,15 @@ class PVCharger:
         if self.charge_switch:
             await self._async_turn_charge_switch(False)
 
-        if self.pid_handle is not None:
-            self.pid_handle()
-            self.pid_handle = None
+        pid_handle = self._handles.pop("pid", None)
+
+        if pid_handle is not None:
+            pid_handle()
 
     async def on_enter_max(self, duration: timedelta = timedelta(minutes=30)) -> None:
         """Load EV battery with maximal power."""
 
-        self.timeisup_handle = async_call_later(
+        self._handles["timer"] = async_call_later(
             self.hass, duration, self._async_time_is_up
         )
         self.control = self.charge_max
@@ -234,9 +230,10 @@ class PVCharger:
     async def on_exit_max(self) -> None:
         """Cancel pending timeouts."""
 
-        if self.timeisup_handle is not None:
-            self.timeisup_handle()
-            self.timeisup_handle = None
+        timer_handle = self._handles.pop("timer", None)
+        if timer_handle is not None:
+            timer_handle()
+            timer_handle = None
 
         if self.charge_switch:
             await self._async_turn_charge_switch(False)
