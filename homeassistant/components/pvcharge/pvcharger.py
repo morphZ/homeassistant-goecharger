@@ -66,8 +66,16 @@ class PVCharger:
 
         # Initialize basic controller variables
         self.control = charge_min
-        self.current = float(self.hass.states.get(self.balance_entity).state)  # type: ignore
-        self.soc = float(self.hass.states.get(self.soc_entity).state)  # type: ignore
+
+        try:
+            self.current = float(self.hass.states.get(self.balance_entity).state)  # type: ignore
+        except ValueError:
+            self.current = self.balance_setpoint
+
+        try:
+            self.soc = float(self.hass.states.get(self.soc_entity).state)  # type: ignore
+        except ValueError:
+            self.soc = self.low_value
 
         self._handles: dict[str, Any] = {}
 
@@ -80,8 +88,8 @@ class PVCharger:
         )
 
         self.pid = PID(
-            -1.0,
-            -0.1,
+            -0.5,
+            -0.05,
             0.0,
             setpoint=self.balance_setpoint,
             sample_time=1,
