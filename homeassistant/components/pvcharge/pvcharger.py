@@ -1,8 +1,10 @@
 """Logic and code to run pvcharge."""
 from __future__ import annotations
 
+from collections import deque
 from datetime import timedelta
 import logging
+from statistics import mean
 from typing import Any
 
 from simple_pid import PID
@@ -39,6 +41,7 @@ class PVCharger:
         hass: HomeAssistant,
         balance_entity,
         balance_setpoint,
+        balance_ma_length,
         charge_switch,
         charge_min,
         charge_max,
@@ -54,6 +57,7 @@ class PVCharger:
         self.hass = hass
         self.balance_entity = balance_entity
         self.balance_setpoint = balance_setpoint
+        self._balance_store: deque = deque(maxlen=balance_ma_length)
         self.charge_switch = charge_switch
         self.charge_min = charge_min
         self.charge_max = charge_max
@@ -69,6 +73,7 @@ class PVCharger:
 
         try:
             self.current = float(self.hass.states.get(self.balance_entity).state)  # type: ignore
+            self._balance_store.append(self.current)
         except ValueError:
             self.current = self.balance_setpoint
 
@@ -104,6 +109,12 @@ class PVCharger:
     ) -> None:
         """Update internal balance variable and change state if necessary."""
         self.current = float(new_state.state)
+        self._balance_store.append(self.current)
+        _LOGGER.debug(
+            "self._balance_store=%s, mean=%s",
+            self._balance_store,
+            mean(self._balance_store),
+        )
 
         # Check if mode change is necessary
         if self.is_pv() and not self.enough_power:  # type: ignore
@@ -149,7 +160,10 @@ class PVCharger:
         _LOGGER.debug("Call _async_update_pid() callback at %s", event_time)
         self.control = self.pid(self.current)
         _LOGGER.debug(
-            "Data is self.current=%s, self.control=%s", self.current, self.control
+            "Data is self.current=%s, self.control=%s, ma_balance=%s",
+            self.current,
+            self.control,
+            mean(self._balance_store),
         )
         await self._async_update_control()
 
@@ -165,7 +179,7 @@ class PVCharger:
             if self.is_pv()  # type: ignore
             else self.pv_threshold
         )
-        return self.current > threshold
+        return (sum(self._balance_store) / len(self._balance_store)) > threshold
 
     @property
     def min_soc(self) -> bool:
