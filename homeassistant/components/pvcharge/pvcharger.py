@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import deque
 from datetime import timedelta
 import logging
-from statistics import mean
+from statistics import StatisticsError, mean
 from typing import Any
 
 from simple_pid import PID
@@ -179,7 +179,13 @@ class PVCharger:
             if self.is_pv()  # type: ignore
             else self.pv_threshold
         )
-        return (sum(self._balance_store) / len(self._balance_store)) > threshold
+
+        try:
+            value = mean(self._balance_store)
+        except StatisticsError:
+            value = self.current
+
+        return value > threshold
 
     @property
     def min_soc(self) -> bool:
