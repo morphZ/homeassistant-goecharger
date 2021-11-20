@@ -22,21 +22,21 @@ _LOGGER = logging.getLogger(__name__)
 
 AMP_MIN = 6.0
 AMP_MAX = 32.0
+POWER_MIN = 2.0
+POWER_MAX = 11.0
+SOC_MIN = 0.25
+SOC_MID = 0.5
 
 
 class PVCharger:
     # pylint: disable=no-member
     """Finite state machine to control the PV charging."""
 
-    states = ["off", "idle", "pv", "max", "low_batt", "calendar"]
+    states = ["off", "loading", "boosting", "idle"]
     transitions = [
-        ["auto", ["off", "max", "low_batt", "calendar"], "low_batt", [], "min_soc"],
-        ["auto", ["off", "max", "low_batt", "calendar"], "pv", "enough_power"],
-        ["auto", ["off", "max", "low_batt", "calendar"], "idle"],
-        ["start", "idle", "pv"],
-        ["pause", "pv", "idle"],
-        ["boost", "*", "max"],
-        ["soc_low", ["idle", "pv"], "low_batt"],
+        ["run", ["off", "max", "idle"], "loading"],
+        ["pause", "loading", "idle"],
+        ["boost", ["load", "idle"], "boosting"],
         ["halt", "*", "off"],
     ]
 
@@ -60,6 +60,8 @@ class PVCharger:
         self.pid_interval = pid_interval
         self.amp_min = AMP_MIN
         self.amp_max = AMP_MAX
+        self._power_limits = (POWER_MIN, POWER_MAX)
+        self._soc_limits = (SOC_MIN, SOC_MID)
 
         # Initialize basic controller variables
         self.control = self.amp_min
@@ -69,9 +71,9 @@ class PVCharger:
         self._status: GoeStatus | None = None
 
         try:
-            self.soc = float(self.hass.states.get(self.soc_entity).state)  # type: ignore
+            self.soc = float(self.hass.states.get(self.soc_entity).state) / 100.0  # type: ignore
         except ValueError:
-            self.soc = self.low_value
+            self.soc = 0.48
 
         self._handles: dict[str, Any] = {}
 
@@ -92,6 +94,46 @@ class PVCharger:
             output_limits=(self.amp_min, self.amp_max),
         )
 
+    @property
+    def enough_power(self) -> bool:
+        """Check if enough power is available."""
+
+        if self.soc < 0.5:
+            return True
+
+        return False
+        # threshold = (
+        #     self.pv_threshold - self.pv_hysteresis
+        #     if self.is_pv()  # type: ignore
+        #     else self.pv_threshold
+        # )
+
+        # try:
+        #     value = mean(self._balance_store)
+        # except StatisticsError:
+        #     value = self.current
+
+        # return value > threshold
+
+    def _calculate_setpoint(self):
+        """Calculate power setpoint from soc."""
+
+        soc_min, soc_mid = self._soc_limits
+        p_min, p_max = self._power_limits
+        grad = (p_max - p_min) / (soc_mid - soc_min)
+
+        # Calculate setpoint with respect to SOC and state
+        if self.is_boosting():
+            power = p_max
+        elif self.soc < soc_min:
+            power = p_max
+        elif self.soc < soc_mid:
+            power = p_max - grad * (self.soc - soc_min)
+        else:
+            power = p_min
+
+        return power
+
     async def _async_update_status(self):
         """Read power value of charger from API."""
 
@@ -107,29 +149,21 @@ class PVCharger:
         old_state,
         new_state,
     ) -> None:
-        """Update internal soc variable and change state if necessary."""
-        self.soc = float(new_state.state)
+        """Update internal soc variable."""
+        self.soc = float(new_state.state) / 100.0
 
-        # Check if mode change is necesasry
-        if self.is_low_batt() and self.min_soc:  # type: ignore
-            await self.auto()  # type: ignore
+    async def _async_switch_charger(self, on: bool = True) -> None:
+        """Switch go-e charger on or off via API call."""
+        alw = 1 if on else 0
 
-        if (self.is_idle() or self.is_pv()) and not self.min_soc:  # type: ignore
-            await self.soc_low()  # type: ignore
+        async with self._session.get(f"{self._base_url}/mqtt?payload=alw={alw}") as res:
+            _LOGGER.debug("Response of alw update request: %s", res)
 
     async def _async_update_control(self) -> None:
+        """Update charging current via API call."""
         amp = round(self.control)
         async with self._session.get(f"{self._base_url}/mqtt?payload=amx={amp}") as res:
             _LOGGER.debug("Response of amp update request: %s", res)
-
-    # async def _async_turn_charge_switch(self, value: bool) -> None:
-    #     service = "turn_on" if value else "turn_off"
-
-    #     await self.hass.services.async_call(
-    #         "switch",
-    #         service,
-    #         target={"entity_id": self.charge_switch},
-    #     )
 
     async def _async_update_pid(self, event_time) -> None:
         """Update pid controller values."""
@@ -137,9 +171,18 @@ class PVCharger:
 
         await self._async_update_status()
 
-        setpoint = float(self.hass.states.get("input_number.charge_power").state)  # type: ignore
-        self.pid.setpoint = setpoint
+        # Check if state change is necessary
+        if self.is_idle():  # type: ignore
+            if self.enough_power:
+                await self.run()  # type: ignore
 
+            return  # in case of idle state we can exit here
+
+        if self.is_loading() and not self.enough_power:  # type: ignore
+            await self.pause()  # type: ignore
+            return
+
+        self.pid.setpoint = self._calculate_setpoint()
         self.control = self.pid(self._charge_power)  # type: ignore
         _LOGGER.debug(
             "Data is self._charge_power=%s, self.control=%s, self.pid.setpoint=%s",
@@ -149,41 +192,8 @@ class PVCharger:
         )
         await self._async_update_control()
 
-    async def _async_time_is_up(self, *args, **kwargs) -> None:
-        self._handles.pop("timer", None)
-        await self.auto()  # type: ignore
-
-    @property
-    def enough_power(self) -> bool:
-        """Check if enough power is available."""
-
-        return True
-        # threshold = (
-        #     self.pv_threshold - self.pv_hysteresis
-        #     if self.is_pv()  # type: ignore
-        #     else self.pv_threshold
-        # )
-
-        # try:
-        #     value = mean(self._balance_store)
-        # except StatisticsError:
-        #     value = self.current
-
-        # return value > threshold
-
-    @property
-    def min_soc(self) -> bool:
-        """Check if minimal SOC is reached."""
-        return self.soc >= self.low_value
-
     async def on_exit_off(self) -> None:
-        """Register state watcher callback when leaving off mode."""
-
-        # self._handles["balance"] = async_track_state_change(
-        #     self.hass,
-        #     [self.balance_entity],
-        #     self._async_watch_balance,
-        # )
+        """Register callbacks when leaving off mode."""
 
         self._handles["soc"] = async_track_state_change(
             self.hass,
@@ -191,43 +201,40 @@ class PVCharger:
             self._async_watch_soc,
         )
 
-    async def on_enter_off(self) -> None:
-        """Cancel state watcher callback when entering off mode."""
-        for handle in ("balance", "soc"):
-            self._handles.pop(handle).async_remove()
-
-    async def on_enter_pv(self, *args, **kwargs) -> None:
-        """Start control loop for pv controlled charging."""
-        _LOGGER.info("Enter PID charging mode")
-
-        # Start PID mode with minimal charge power
-        self.control = self.amp_min
-        # await self._async_update_control()
-        self.pid.set_auto_mode(True, self.control)
-
-        # if self.charge_switch:
-        #     await self._async_turn_charge_switch(True)
-
         self._handles["pid"] = async_track_time_interval(
             self.hass,
             self._async_update_pid,
             timedelta(seconds=self.pid_interval),
         )
 
-    async def on_exit_pv(self) -> None:
-        """Stop pid loop."""
+        await self._async_switch_charger(True)
 
+    async def on_enter_off(self) -> None:
+        """Cancel callbacks when entering off mode."""
+        for unsub in self._handles.values():
+            unsub()
+
+        self._handles = {}
+
+        await self._async_switch_charger(False)
+
+    async def on_enter_idle(self) -> None:
+        """Switch off charger and PID controller."""
+        await self._async_switch_charger(False)
         self.pid.set_auto_mode(False)
 
-        # if self.charge_switch:
-        #     await self._async_turn_charge_switch(False)
+    async def on_exit_idle(self) -> None:
+        """Switch on charger and PID controller."""
+        await self._async_switch_charger(True)
+        self.pid.set_auto_mode(True, self._power_limits[0])
 
-        pid_handle = self._handles.pop("pid", None)
+    async def _async_time_is_up(self, *args, **kwargs) -> None:
+        self._handles.pop("timer", None)
+        await self.auto()  # type: ignore
 
-        if pid_handle is not None:
-            pid_handle()
-
-    async def on_enter_max(self, duration: timedelta = timedelta(minutes=30)) -> None:
+    async def on_enter_boosting(
+        self, duration: timedelta = timedelta(minutes=30)
+    ) -> None:
         """Load EV battery with maximal power."""
 
         self._handles["timer"] = async_call_later(
@@ -239,29 +246,13 @@ class PVCharger:
         # if self.charge_switch:
         #     await self._async_turn_charge_switch(True)
 
-    async def on_exit_max(self) -> None:
+    async def on_exit_boosting(self) -> None:
         """Cancel pending timeouts."""
 
         timer_handle = self._handles.pop("timer", None)
         if timer_handle is not None:
             timer_handle()
             timer_handle = None
-
-        # if self.charge_switch:
-        #     await self._async_turn_charge_switch(False)
-
-    async def on_enter_low_batt(self) -> None:
-        """Charge with max power until min soc is reached."""
-        _LOGGER.info("Enter battery low mode")
-
-        self.control = self.amp_max
-        # await self._async_update_control()
-
-        # if self.charge_switch:
-        #     await self._async_turn_charge_switch(True)
-
-    async def on_exit_low_batt(self) -> None:
-        """Turn charge switch off."""
 
         # if self.charge_switch:
         #     await self._async_turn_charge_switch(False)
