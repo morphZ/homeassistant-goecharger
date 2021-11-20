@@ -115,6 +115,11 @@ class PVCharger:
 
         # return value > threshold
 
+    @property
+    def car_ready(self) -> bool:
+        """Check if car is ready to be charged."""
+        return self._status.car not in [1]  # type: ignore
+
     def _calculate_setpoint(self):
         """Calculate power setpoint from soc."""
 
@@ -160,9 +165,19 @@ class PVCharger:
             _LOGGER.debug("Response of alw update request: %s", res)
 
     async def _async_update_control(self) -> None:
-        """Update charging current via API call."""
-        amp = round(self.control)
-        async with self._session.get(f"{self._base_url}/mqtt?payload=amx={amp}") as res:
+        """Update PID and set charging current via API call."""
+        self.pid.setpoint = self._calculate_setpoint()
+        self.control = self.pid(self._charge_power)  # type: ignore
+        _LOGGER.debug(
+            "New data is self._charge_power=%s, self.control=%s, self.pid.setpoint=%s",
+            self._charge_power,
+            self.control,
+            self.pid.setpoint,
+        )
+
+        async with self._session.get(
+            f"{self._base_url}/mqtt?payload=amx={round(self.control)}"
+        ) as res:
             _LOGGER.debug("Response of amp update request: %s", res)
 
     async def _async_update_pid(self, event_time) -> None:
@@ -171,26 +186,18 @@ class PVCharger:
 
         await self._async_update_status()
 
-        # Check if state change is necessary
+        # Check for changes while in idle mode
         if self.is_idle():  # type: ignore
-            if self.enough_power:
+            if self.enough_power and self.car_ready:
                 await self.run()  # type: ignore
 
-            return  # in case of idle state we can exit here
+        # Check for changes while in loading state
+        if self.is_loading():  # type: ignore
+            if not (self.enough_power and self.car_ready):
+                await self.pause()  # type: ignore
+                return
 
-        if self.is_loading() and not self.enough_power:  # type: ignore
-            await self.pause()  # type: ignore
-            return
-
-        self.pid.setpoint = self._calculate_setpoint()
-        self.control = self.pid(self._charge_power)  # type: ignore
-        _LOGGER.debug(
-            "Data is self._charge_power=%s, self.control=%s, self.pid.setpoint=%s",
-            self._charge_power,
-            self.control,
-            self.pid.setpoint,
-        )
-        await self._async_update_control()
+            await self._async_update_control()
 
     async def on_exit_off(self) -> None:
         """Register callbacks when leaving off mode."""
