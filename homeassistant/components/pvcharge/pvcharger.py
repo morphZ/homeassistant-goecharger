@@ -1,8 +1,10 @@
 """Logic and code to run pvcharge."""
 from __future__ import annotations
 
+from collections import deque
 from datetime import timedelta
 import logging
+from statistics import mean
 from typing import Any
 
 from simple_pid import PID
@@ -26,6 +28,7 @@ POWER_MIN = 2.0
 POWER_MAX = 11.0
 SOC_MIN = 0.25
 SOC_MID = 0.5
+PV_UPDATE_INTERVAL = 20
 
 
 class PVCharger:
@@ -45,6 +48,7 @@ class PVCharger:
         hass: HomeAssistant,
         charger_host,
         duration,
+        balance_entity,
         soc_entity,
         low_value,
         pid_interval,
@@ -55,13 +59,18 @@ class PVCharger:
 
         self._host = charger_host
         self.duration = duration
-        self.soc_entity = soc_entity
+        self._balance_entity = balance_entity
+        self._soc_entity = soc_entity
         self.low_value = low_value
-        self.pid_interval = pid_interval
+        self._pid_interval = pid_interval
+        self._pv_interval = PV_UPDATE_INTERVAL
         self.amp_min = AMP_MIN
         self.amp_max = AMP_MAX
         self._power_limits = (POWER_MIN, POWER_MAX)
         self._soc_limits = (SOC_MIN, SOC_MID)
+        self._balance_store: deque = deque(
+            [], max(1, self._pv_interval // self._pid_interval)
+        )
 
         # Initialize basic controller variables
         self.control = self.amp_min
@@ -71,9 +80,17 @@ class PVCharger:
         self._status: GoeStatus | None = None
 
         try:
-            self.soc = float(self.hass.states.get(self.soc_entity).state) / 100.0  # type: ignore
+            self.soc = float(self.hass.states.get(self._soc_entity).state) / 100.0  # type: ignore
         except ValueError:
             self.soc = 0.48
+
+        try:
+            self._balance = float(self.hass.states.get(self._balance_entity).state)  # type: ignore
+            self._balance_store.append(self._balance)
+        except ValueError:
+            self._balance = 0.0
+
+        self._enough_pv = False
 
         self._handles: dict[str, Any] = {}
 
@@ -98,7 +115,7 @@ class PVCharger:
     def enough_power(self) -> bool:
         """Check if enough power is available."""
 
-        if self.soc < 0.5:
+        if self.soc < self._soc_limits[1]:
             return True
 
         return False
@@ -142,20 +159,27 @@ class PVCharger:
     async def _async_update_status(self):
         """Read power value of charger from API."""
 
+        self._balance_store.append(self._balance)
+
         async with self._session.get(self._base_url + "/status") as res:
             status = await res.text()
 
         self._status = GoeStatus.parse_raw(status)
         self._charge_power = round(0.01 * self._status.nrg[11], 2)
 
-    async def _async_watch_soc(
+    async def _async_watch_entities(
         self,
         entity,
         old_state,
         new_state,
     ) -> None:
         """Update internal soc variable."""
-        self.soc = float(new_state.state) / 100.0
+
+        if entity == self._soc_entity:
+            self.soc = float(new_state.state) / 100.0
+
+        if entity == self._balance_entity:
+            self._balance = float(new_state.state)
 
     async def _async_switch_charger(self, on: bool = True) -> None:
         """Switch go-e charger on or off via API call."""
@@ -179,6 +203,23 @@ class PVCharger:
             f"{self._base_url}/mqtt?payload=amx={round(self.control)}"
         ) as res:
             _LOGGER.debug("Response of amp update request: %s", res)
+
+    async def _async_update_pv(self, event_time) -> None:
+        """Update PV generation status (enough / not enough)."""
+
+        _LOGGER.debug("Call _async_update_pv() callback at %s", event_time)
+
+        balance_mean = mean(self._balance_store)
+        balance_tsh = 2.0
+
+        _LOGGER.debug(
+            "New data is store=%s, mean=%s, tsh=%s",
+            self._balance_store,
+            balance_mean,
+            balance_tsh,
+        )
+
+        self._enough_pv = balance_mean > balance_tsh
 
     async def _async_update_pid(self, event_time) -> None:
         """Update pid controller values."""
@@ -204,14 +245,20 @@ class PVCharger:
 
         self._handles["soc"] = async_track_state_change(
             self.hass,
-            [self.soc_entity],
-            self._async_watch_soc,
+            [self._soc_entity, self._balance_entity],
+            self._async_watch_entities,
         )
 
         self._handles["pid"] = async_track_time_interval(
             self.hass,
             self._async_update_pid,
-            timedelta(seconds=self.pid_interval),
+            timedelta(seconds=self._pid_interval),
+        )
+
+        self._handles["pv"] = async_track_time_interval(
+            self.hass,
+            self._async_update_pv,
+            timedelta(seconds=self._pv_interval),
         )
 
         await self._async_switch_charger(True)
