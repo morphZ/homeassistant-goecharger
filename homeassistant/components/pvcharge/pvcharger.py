@@ -7,6 +7,7 @@ import logging
 from statistics import mean
 from typing import Any
 
+from aiohttp.client_exceptions import ClientConnectorError
 from simple_pid import PID
 from transitions.extensions.asyncio import AsyncMachine
 
@@ -28,7 +29,10 @@ POWER_MIN = 2.0
 POWER_MAX = 11.0
 SOC_MIN = 0.25
 SOC_MID = 0.5
+SOC_HIGH1 = 0.7
+SOC_HIGH2 = 0.9
 PV_UPDATE_INTERVAL = 20
+PV_OFFSET = 0.5
 
 
 class PVCharger:
@@ -67,10 +71,11 @@ class PVCharger:
         self.amp_min = AMP_MIN
         self.amp_max = AMP_MAX
         self._power_limits = (POWER_MIN, POWER_MAX)
-        self._soc_limits = (SOC_MIN, SOC_MID)
+        self._soc_limits = (SOC_MIN, SOC_MID, SOC_HIGH1, SOC_HIGH2)
         self._balance_store: deque = deque(
             [], max(1, self._pv_interval // self._pid_interval)
         )
+        self._balance_mean = 0.0
 
         # Initialize basic controller variables
         self.control = self.amp_min
@@ -114,23 +119,16 @@ class PVCharger:
     @property
     def enough_power(self) -> bool:
         """Check if enough power is available."""
+        offset = PV_OFFSET if self.is_loading() else 0.0  # type: ignore
 
         if self.soc < self._soc_limits[1]:
             return True
-
-        return False
-        # threshold = (
-        #     self.pv_threshold - self.pv_hysteresis
-        #     if self.is_pv()  # type: ignore
-        #     else self.pv_threshold
-        # )
-
-        # try:
-        #     value = mean(self._balance_store)
-        # except StatisticsError:
-        #     value = self.current
-
-        # return value > threshold
+        elif self.soc < self._soc_limits[2]:
+            return self._balance_mean > 0.0 - offset
+        elif self.soc < self._soc_limits[3]:
+            return self._balance_mean > 1.0 - offset
+        else:
+            return self._balance_mean > 2.0 - offset
 
     @property
     def car_ready(self) -> bool:
@@ -140,7 +138,7 @@ class PVCharger:
     def _calculate_setpoint(self):
         """Calculate power setpoint from soc."""
 
-        soc_min, soc_mid = self._soc_limits
+        soc_min, soc_mid = self._soc_limits[:2]
         p_min, p_max = self._power_limits
         grad = (p_max - p_min) / (soc_mid - soc_min)
 
@@ -159,13 +157,16 @@ class PVCharger:
     async def _async_update_status(self):
         """Read power value of charger from API."""
 
-        self._balance_store.append(self._balance)
-
-        async with self._session.get(self._base_url + "/status") as res:
-            status = await res.text()
+        try:
+            async with self._session.get(self._base_url + "/status") as res:
+                status = await res.text()
+        except ClientConnectorError as exc:
+            _LOGGER.exception(exc.msg, exc_info=exc)
 
         self._status = GoeStatus.parse_raw(status)
         self._charge_power = round(0.01 * self._status.nrg[11], 2)
+
+        self._balance_store.append(self._balance + self._charge_power)
 
     async def _async_watch_entities(
         self,
@@ -209,17 +210,13 @@ class PVCharger:
 
         _LOGGER.debug("Call _async_update_pv() callback at %s", event_time)
 
-        balance_mean = mean(self._balance_store)
-        balance_tsh = 2.0
+        self._balance_mean = mean(self._balance_store)
 
         _LOGGER.debug(
-            "New data is store=%s, mean=%s, tsh=%s",
+            "New data is _balance_store=%s, _balance_mean=%s",
             self._balance_store,
-            balance_mean,
-            balance_tsh,
+            self._balance_mean,
         )
-
-        self._enough_pv = balance_mean > balance_tsh
 
     async def _async_update_pid(self, event_time) -> None:
         """Update pid controller values."""
