@@ -86,13 +86,13 @@ class PVCharger:
 
         try:
             self.soc = float(self.hass.states.get(self._soc_entity).state) / 100.0  # type: ignore
-        except ValueError:
+        except (ValueError, AttributeError):
             self.soc = 0.48
 
         try:
             self._balance = float(self.hass.states.get(self._balance_entity).state)  # type: ignore
             self._balance_store.append(self._balance)
-        except ValueError:
+        except (ValueError, AttributeError):
             self._balance = 0.0
 
         self._enough_pv = False
