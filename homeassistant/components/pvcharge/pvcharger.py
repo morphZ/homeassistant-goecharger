@@ -212,7 +212,7 @@ class PVCharger:
 
         self._balance_mean = mean(self._balance_store)
 
-        _LOGGER.debug(
+        _LOGGER.info(
             "New data is _balance_store=%s, _balance_mean=%s",
             self._balance_store,
             self._balance_mean,
