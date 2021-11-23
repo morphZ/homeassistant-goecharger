@@ -31,7 +31,6 @@ SOC_MIN = 0.25
 SOC_MID = 0.5
 SOC_HIGH1 = 0.7
 SOC_HIGH2 = 0.9
-PV_UPDATE_INTERVAL = 20
 PV_OFFSET = 0.5
 
 
@@ -56,6 +55,7 @@ class PVCharger:
         soc_entity,
         low_value,
         pid_interval,
+        pv_interval,
     ) -> None:
         """Set up PVCharger instance."""
 
@@ -67,7 +67,7 @@ class PVCharger:
         self._soc_entity = soc_entity
         self.low_value = low_value
         self._pid_interval = pid_interval
-        self._pv_interval = PV_UPDATE_INTERVAL
+        self._pv_interval = pv_interval
         self.amp_min = AMP_MIN
         self.amp_max = AMP_MAX
         self._power_limits = (POWER_MIN, POWER_MAX)
