@@ -208,7 +208,7 @@ class PVCharger:
     async def _async_update_pv(self, event_time) -> None:
         """Update PV generation status (enough / not enough)."""
 
-        _LOGGER.debug("Call _async_update_pv() callback at %s", event_time)
+        _LOGGER.info("Call _async_update_pv() callback at %s", event_time)
 
         self._balance_mean = mean(self._balance_store)
 
