@@ -56,6 +56,8 @@ class PVCharger:
         low_value,
         pid_interval,
         pv_interval,
+        update_service,
+        update_interval,
     ) -> None:
         """Set up PVCharger instance."""
 
@@ -68,6 +70,9 @@ class PVCharger:
         self.low_value = low_value
         self._pid_interval = pid_interval
         self._pv_interval = pv_interval
+        self._update_service = update_service
+        self._update_interval = update_interval
+
         self.amp_min = AMP_MIN
         self.amp_max = AMP_MAX
         self._power_limits = (POWER_MIN, POWER_MAX)
@@ -237,6 +242,12 @@ class PVCharger:
 
             await self._async_update_control()
 
+    async def _async_update_service(self, event_time) -> None:
+        """Call the update service."""
+        domain, name = self._update_service.split(".")
+
+        await self.hass.services.async_call(domain, name, {})
+
     async def on_exit_off(self) -> None:
         """Register callbacks when leaving off mode."""
 
@@ -256,6 +267,12 @@ class PVCharger:
             self.hass,
             self._async_update_pv,
             timedelta(seconds=self._pv_interval),
+        )
+
+        self._handles["update"] = async_track_time_interval(
+            self.hass,
+            self._async_update_service,
+            timedelta(seconds=self._update_interval),
         )
 
         await self._async_switch_charger(True)
