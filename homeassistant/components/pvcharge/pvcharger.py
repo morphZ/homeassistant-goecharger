@@ -244,8 +244,12 @@ class PVCharger:
 
     async def _async_update_service(self, event_time) -> None:
         """Call the update service."""
-        domain, name = self._update_service.split(".")
+        if not self._update_service:
+            return
 
+        _LOGGER.info("Calling service %s", self._update_service)
+
+        domain, name = self._update_service.split(".")
         await self.hass.services.async_call(domain, name, {})
 
     async def on_exit_off(self) -> None:
