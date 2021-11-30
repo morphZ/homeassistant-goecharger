@@ -166,7 +166,7 @@ class PVCharger:
             async with self._session.get(self._base_url + "/status") as res:
                 status = await res.text()
         except ClientConnectorError as exc:
-            _LOGGER.exception(exc.msg, exc_info=exc)
+            _LOGGER.exception(exc, exc_info=exc)
 
         self._status = GoeStatus.parse_raw(status)
         self._charge_power = round(0.01 * self._status.nrg[11], 2)
