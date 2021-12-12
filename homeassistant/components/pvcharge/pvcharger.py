@@ -247,10 +247,10 @@ class PVCharger:
         if not self._update_service:
             return
 
-        _LOGGER.info("Calling service %s", self._update_service)
-
-        domain, name = self._update_service.split(".")
-        await self.hass.services.async_call(domain, name, {})
+        if self._charge_power > 0.5 * self._power_limits[0]:
+            _LOGGER.info("Calling service %s", self._update_service)
+            domain, name = self._update_service.split(".")
+            await self.hass.services.async_call(domain, name, {})
 
     async def on_exit_off(self) -> None:
         """Register callbacks when leaving off mode."""
